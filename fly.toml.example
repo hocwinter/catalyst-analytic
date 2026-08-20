@@ -1,0 +1,23 @@
+# Copy this file to fly.toml ONLY if you want to configure Fly.io manually.
+# Replace the app name with a globally unique Fly.io app name.
+app = "replace-with-your-unique-app-name"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 60
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
