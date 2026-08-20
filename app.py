@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Momentum Scanner V6.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Momentum Scanner V6.7 Freshness Guard", page_icon="📈", layout="wide")
 
 
 DEFAULT_TICKERS = """
@@ -73,14 +73,325 @@ def download_history(tickers):
         progress=False,
     )
 
-def ticker_frame(blob, ticker, n_tickers):
-    if n_tickers == 1:
-        df = blob.copy()
-    else:
-        try:
-            df = blob[ticker].copy()
-        except Exception:
+
+@st.cache_data(ttl=45, show_spinner=False)
+def download_intraday(ticker):
+    """
+    Near-real-time intraday overlay.
+    Yahoo/yfinance is not exchange-direct market data and can still be delayed.
+    1-minute bars are used when available, including pre/post market.
+    """
+    t = str(ticker).upper().strip()
+    try:
+        df = yf.download(
+            tickers=t,
+            period="1d",
+            interval="1m",
+            auto_adjust=False,
+            prepost=True,
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty:
             return pd.DataFrame()
+        # Normalize current yfinance MultiIndex behavior for one ticker.
+        return ticker_frame(df, t, 1) if "ticker_frame" in globals() else df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def download_intraday_5d(ticker):
+    """
+    5-minute history used for a rough same-time intraday volume comparison.
+    This is intentionally lightweight and is only called for focused Buy Score checks.
+    """
+    t = str(ticker).upper().strip()
+    try:
+        df = yf.download(
+            tickers=t,
+            period="5d",
+            interval="5m",
+            auto_adjust=False,
+            prepost=False,
+            progress=False,
+            threads=False,
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return ticker_frame(df, t, 1) if "ticker_frame" in globals() else df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _session_dates(index):
+    try:
+        idx = pd.DatetimeIndex(index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("America/New_York")
+        return pd.Series(idx.date, index=idx)
+    except Exception:
+        return pd.Series(dtype=object)
+
+
+def live_overlay_metrics(daily_metrics, ticker):
+    """
+    Overlay intraday fields onto daily metrics.
+
+    Daily bars still determine structural fields such as 20D high/low and ATR.
+    Intraday data updates:
+      - Price
+      - Day %
+      - Day High / Day Low
+      - Close Location
+      - distance vs 20D high/low/support
+      - 20D breakout/breakdown status
+      - approximate same-time intraday RVOL when 5m history is available
+      - live timestamp
+    """
+    if daily_metrics is None:
+        return None, {"live": False, "reason": "No daily metrics"}
+
+    m = dict(daily_metrics)
+    intraday = download_intraday(ticker)
+    if intraday is None or intraday.empty or "Close" not in intraday.columns:
+        m["Live Data"] = False
+        m["Live Timestamp"] = ""
+        return m, {"live": False, "reason": "No intraday data"}
+
+    intraday = intraday.dropna(subset=["Close"]).copy()
+    if intraday.empty:
+        m["Live Data"] = False
+        m["Live Timestamp"] = ""
+        return m, {"live": False, "reason": "No valid intraday close"}
+
+    price = float(intraday["Close"].iloc[-1])
+    day_high = float(intraday["High"].max()) if "High" in intraday else price
+    day_low = float(intraday["Low"].min()) if "Low" in intraday else price
+
+    # Previous close from the daily history-derived fields.
+    old_price = float(daily_metrics.get("Price", price))
+    old_day_pct = float(daily_metrics.get("Day %", 0) or 0)
+    prev_close = old_price / (1 + old_day_pct / 100) if (1 + old_day_pct / 100) != 0 else old_price
+
+    day_pct = (price / prev_close - 1) * 100 if prev_close else 0.0
+    clv = (price - day_low) / (day_high - day_low) if day_high > day_low else 0.5
+
+    high20 = float(m.get("20D High Price", price))
+    low20 = float(m.get("20D Low Price", price))
+    support10 = float(m.get("10D Support Price", low20))
+
+    m["Price"] = price
+    m["Day %"] = day_pct
+    m["Day High"] = day_high
+    m["Day Low"] = day_low
+    m["Close Location"] = clv
+    m["vs 20D High %"] = (price / high20 - 1) * 100 if high20 else np.nan
+    m["vs 20D Low %"] = (price / low20 - 1) * 100 if low20 else np.nan
+    m["vs 10D Support %"] = (price / support10 - 1) * 100 if support10 else np.nan
+    m["20D Breakout"] = bool(price > high20)
+    m["20D Breakdown"] = bool(price < low20)
+
+    # Recompute current ATR% against today's live price while keeping ATR dollars
+    # approximately anchored to the daily ATR estimate.
+    old_atr_pct = float(daily_metrics.get("ATR %", np.nan))
+    if not np.isnan(old_atr_pct) and old_price:
+        atr_dollars = old_price * old_atr_pct / 100
+        m["ATR %"] = atr_dollars / price * 100 if price else old_atr_pct
+
+    # Approximate same-time RVOL using 5-minute cumulative regular-session volume.
+    # If unavailable, retain the daily RVOL estimate.
+    try:
+        hist5 = download_intraday_5d(ticker)
+        if hist5 is not None and not hist5.empty and "Volume" in hist5.columns:
+            idx = pd.DatetimeIndex(hist5.index)
+            if idx.tz is not None:
+                idx_et = idx.tz_convert("America/New_York")
+            else:
+                idx_et = idx
+            tmp = hist5.copy()
+            tmp["_date"] = idx_et.date
+            tmp["_time"] = idx_et.time
+            unique_dates = list(pd.unique(tmp["_date"]))
+            if len(unique_dates) >= 2:
+                today = unique_dates[-1]
+                prev_dates = unique_dates[:-1]
+                today_rows = tmp[tmp["_date"] == today]
+                if not today_rows.empty:
+                    cutoff = today_rows["_time"].iloc[-1]
+                    current_cum = float(today_rows["Volume"].fillna(0).sum())
+                    prev_cums = []
+                    for d in prev_dates:
+                        drows = tmp[(tmp["_date"] == d) & (tmp["_time"] <= cutoff)]
+                        if not drows.empty:
+                            prev_cums.append(float(drows["Volume"].fillna(0).sum()))
+                    if prev_cums and np.mean(prev_cums) > 0:
+                        m["RVOL"] = current_cum / float(np.mean(prev_cums))
+                        m["Volume"] = current_cum
+    except Exception:
+        pass
+
+    try:
+        ts = pd.Timestamp(intraday.index[-1])
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York")
+        timestamp = ts.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        timestamp = str(intraday.index[-1])
+
+    m["Live Data"] = True
+    m["Live Timestamp"] = timestamp
+    return m, {"live": True, "timestamp": timestamp, "timestamp_obj": intraday.index[-1]}
+
+
+def recompute_momentum_score(m):
+    """Recalculate momentum after the live overlay."""
+    pct = float(m.get("Day %", 0) or 0)
+    rvol = m.get("RVOL", np.nan)
+    clv = m.get("Close Location", np.nan)
+    score = 0
+    score += min(max(pct, 0), 25) * 1.4
+    if not np.isnan(rvol):
+        score += min(max(float(rvol) - 1, 0), 5) * 7
+    score += 15 if bool(m.get("20D Breakout", False)) else 0
+    score += 5 if bool(m.get("50D Breakout", False)) else 0
+    if not np.isnan(clv):
+        score += max(min(float(clv), 1), 0) * 10
+    m["Momentum Score"] = min(round(score, 1), 100)
+    return m
+
+
+def freshness_status(live_meta, max_age_minutes=20):
+    """
+    Strict stale-data guard.
+
+    During US extended trading hours (04:00-20:00 ET, weekdays), live data must:
+      - be from today's ET date
+      - be no older than max_age_minutes
+
+    Outside those hours, the market is treated as closed and daily/last-session
+    data may be used only when explicitly labeled as such.
+    """
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    weekday = now_et.weekday() < 5
+    minutes_now = now_et.hour * 60 + now_et.minute
+    extended_open = weekday and (4 * 60 <= minutes_now < 20 * 60)
+
+    if not live_meta or not live_meta.get("live"):
+        return {
+            "ok": not extended_open,
+            "market_open": extended_open,
+            "stale": extended_open,
+            "age_minutes": None,
+            "message": "No live intraday timestamp available."
+        }
+
+    ts_raw = live_meta.get("timestamp_obj") or live_meta.get("timestamp")
+    try:
+        ts = pd.Timestamp(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("America/New_York")
+        else:
+            ts = ts.tz_convert("America/New_York")
+    except Exception:
+        return {
+            "ok": not extended_open,
+            "market_open": extended_open,
+            "stale": extended_open,
+            "age_minutes": None,
+            "message": "Could not parse live timestamp."
+        }
+
+    age_minutes = max((now_et - ts).total_seconds() / 60.0, 0.0)
+    same_date = ts.date() == now_et.date()
+
+    if extended_open:
+        ok = same_date and age_minutes <= max_age_minutes
+        return {
+            "ok": ok,
+            "market_open": True,
+            "stale": not ok,
+            "age_minutes": age_minutes,
+            "timestamp": ts,
+            "message": (
+                f"Live data age {age_minutes:.1f} min."
+                if ok else
+                f"Stale intraday data: last bar {ts.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                f"({age_minutes:.1f} min old)."
+            )
+        }
+
+    return {
+        "ok": True,
+        "market_open": False,
+        "stale": False,
+        "age_minutes": age_minutes,
+        "timestamp": ts,
+        "message": f"Market closed; latest intraday bar {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}."
+    }
+
+
+def ticker_frame(blob, ticker, n_tickers):
+    """
+    Normalize yfinance output for both single- and multi-ticker downloads.
+
+    Recent yfinance versions may return MultiIndex columns even when only one
+    ticker is requested. Older code assumed a single ticker always had flat
+    OHLCV columns, which caused valid symbols such as BE to appear as if no
+    market data existed.
+    """
+    if blob is None or getattr(blob, "empty", True):
+        return pd.DataFrame()
+
+    df = blob.copy()
+
+    # yfinance can return:
+    #   MultiIndex level 0 = ticker, level 1 = Price
+    # or
+    #   MultiIndex level 0 = Price, level 1 = ticker
+    if isinstance(df.columns, pd.MultiIndex):
+        extracted = None
+
+        # Try each column level for the requested ticker.
+        for level in range(df.columns.nlevels):
+            values = set(str(x) for x in df.columns.get_level_values(level))
+            if ticker in values:
+                try:
+                    extracted = df.xs(ticker, axis=1, level=level, drop_level=True).copy()
+                    break
+                except Exception:
+                    pass
+
+        # If only one ticker was requested and the ticker label is not exposed
+        # in a predictable level, identify the OHLCV level and flatten to it.
+        if extracted is None and n_tickers == 1:
+            price_fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+            for level in range(df.columns.nlevels):
+                vals = set(str(x) for x in df.columns.get_level_values(level))
+                if len(price_fields.intersection(vals)) >= 3:
+                    try:
+                        # If another level contains only one repeated label,
+                        # dropping it leaves ordinary OHLCV columns.
+                        other_levels = [i for i in range(df.columns.nlevels) if i != level]
+                        candidate = df.copy()
+                        # Rebuild columns from the detected price-field level.
+                        candidate.columns = [str(x) for x in df.columns.get_level_values(level)]
+                        extracted = candidate
+                        break
+                    except Exception:
+                        pass
+
+        if extracted is None:
+            return pd.DataFrame()
+        df = extracted
+
+    # Final defensive cleanup.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join(str(x) for x in col if str(x) not in ("", "None"))
+            for col in df.columns
+        ]
+
     return df.dropna(how="all")
 
 def compute_metrics(df):
@@ -139,10 +450,15 @@ def compute_metrics(df):
         score += max(min(clv, 1), 0) * 10
     score = min(round(score, 1), 100)
 
+    day_high = float(df["High"].dropna().iloc[-1]) if "High" in df and len(df["High"].dropna()) else last
+    day_low = float(df["Low"].dropna().iloc[-1]) if "Low" in df and len(df["Low"].dropna()) else last
+
     return {
         "Price": last, "Day %": pct, "5D %": ret5, "20D %": ret20,
         "RVOL": rvol, "Volume": v_last,
         "20D Breakout": breakout20, "50D Breakout": breakout50, "20D Breakdown": breakdown20,
+        "20D High Price": prior20, "20D Low Price": prior20low, "10D Support Price": prior10low,
+        "Day High": day_high, "Day Low": day_low,
         "vs 20D High %": dist20, "vs 20D Low %": dist20low, "vs 10D Support %": dist10support,
         "ATR %": atr_pct, "Close Location": clv,
         "Momentum Score": score,
@@ -150,9 +466,10 @@ def compute_metrics(df):
 
 SCAN_COLUMNS = [
     "Ticker", "Price", "Day %", "5D %", "20D %", "RVOL", "Volume",
-    "20D Breakout", "50D Breakout", "20D Breakdown", "vs 20D High %",
-    "vs 20D Low %", "vs 10D Support %", "ATR %", "Close Location",
-    "Momentum Score",
+    "20D Breakout", "50D Breakout", "20D Breakdown",
+    "20D High Price", "20D Low Price", "10D Support Price", "Day High", "Day Low",
+    "vs 20D High %", "vs 20D Low %", "vs 10D Support %", "ATR %", "Close Location",
+    "Momentum Score", "Live Data", "Live Timestamp",
 ]
 
 def scan_universe(tickers, progress=None):
@@ -341,6 +658,37 @@ TICKER_GROUP_HINTS = {
     **{x:"Small Caps" for x in "IWM IJR".split()},
 }
 
+
+# ETF catalyst logic:
+# Industry/sector ETFs should not be penalized just because they do not publish
+# company-style earnings/FDA/contract headlines. Their catalyst quality is
+# inferred from group leadership, breadth, relative strength and volume.
+ETF_GROUP_HINTS = {
+    **{x:"Technology" for x in "XLK VGT".split()},
+    **{x:"Semiconductors" for x in "SMH SOXX XSD".split()},
+    **{x:"Software / Cloud" for x in "IGV SKYY CLOU".split()},
+    **{x:"Cybersecurity" for x in "CIBR HACK BUG".split()},
+    **{x:"Communication / Internet" for x in "XLC FDN".split()},
+    **{x:"Consumer Discretionary" for x in "XLY RTH".split()},
+    **{x:"Consumer Staples" for x in "XLP".split()},
+    **{x:"Financials / Banks" for x in "XLF KBE KRE".split()},
+    **{x:"Industrials" for x in "XLI PAVE".split()},
+    **{x:"Aerospace / Defense" for x in "ITA XAR".split()},
+    **{x:"Energy" for x in "XLE XOP OIH".split()},
+    **{x:"Utilities" for x in "XLU".split()},
+    **{x:"Health Care" for x in "XLV IHI".split()},
+    **{x:"Biotech" for x in "XBI IBB".split()},
+    **{x:"Materials / Metals" for x in "XLB XME".split()},
+    **{x:"Real Estate" for x in "XLRE IYR".split()},
+    **{x:"Homebuilders" for x in "XHB ITB".split()},
+    **{x:"Transportation" for x in "IYT".split()},
+    **{x:"Small Caps" for x in "IWM IJR".split()},
+    **{x:"Mid Caps" for x in "MDY".split()},
+    **{x:"Growth" for x in "QQQ SPYG IWF".split()},
+    **{x:"Value" for x in "SPYV IWD".split()},
+}
+BROAD_MARKET_ETFS = {"SPY", "DIA"}
+
 CATALYST_POINTS = {"A":20.0, "B":15.0, "C":8.0, "?":4.0, "Risk":0.0}
 
 
@@ -424,7 +772,7 @@ def _market_component(regime, direction=1):
 
 
 def _sector_component(ticker, rotation, direction=1):
-    group = TICKER_GROUP_HINTS.get(str(ticker).upper())
+    group = TICKER_GROUP_HINTS.get(str(ticker).upper()) or ETF_GROUP_HINTS.get(str(ticker).upper())
     if group is None or rotation is None or rotation.empty:
         return 2.5, group
     hit = rotation[rotation["Group"] == group]
@@ -460,9 +808,117 @@ def _risk_reward_component(m, direction=1):
     return float(clamp(vol_pts + support_pts, 0, 10))
 
 
+
+def resolve_catalyst(ticker, metrics, rotation=None, regime=None):
+    """
+    Return a structured catalyst signal.
+
+    Stocks: company-news heuristic.
+    Sector/industry ETFs: group leadership + breadth + RVOL + persistence.
+    Broad-market ETFs: market regime + ETF trend/breakout.
+    """
+    t = str(ticker).upper().strip()
+
+    if t in ETF_GROUP_HINTS:
+        group = ETF_GROUP_HINTS[t]
+        points = 7.0
+        details = []
+
+        if rotation is not None and not rotation.empty:
+            hit = rotation[rotation["Group"] == group]
+            if not hit.empty:
+                r = hit.iloc[0]
+                leadership = float(r.get("Leadership Score", 50))
+                breadth = float(r.get("20D Breakout Breadth %", 0))
+                rvol = float(r.get("Median RVOL", 1))
+                rs5 = float(r.get("RS vs SPY 5D", 0))
+                state = str(r.get("State", "Mixed / Transition"))
+
+                # 0..8 leadership contribution
+                points += clamp((leadership - 35) / 65 * 8, 0, 8)
+                # 0..3 breakout breadth
+                points += clamp(breadth / 100 * 3, 0, 3)
+                # 0..2 volume confirmation
+                points += clamp((rvol - 0.8) / 1.7 * 2, 0, 2)
+
+                # Persistence / state adjustment.
+                if state == "Leading":
+                    points += 2
+                elif state == "Emerging / Improving":
+                    points += 1.5
+                elif state == "Pullback in Leader":
+                    points += 0.5
+                elif state == "Deteriorating":
+                    points -= 2
+                elif state == "Losing Leadership":
+                    points -= 4
+
+                if rs5 > 2:
+                    points += 1
+                elif rs5 < -2:
+                    points -= 1
+
+                details.append(
+                    f"{group}: {state}; leadership {leadership:.0f}/100; "
+                    f"20D breakout breadth {breadth:.0f}%; median RVOL {rvol:.2f}x; "
+                    f"5D RS vs SPY {rs5:+.2f}%."
+                )
+
+        # ETF itself can add confirmation but not dominate the score.
+        if bool(metrics.get("20D Breakout", False)):
+            points += 1.5
+        day = float(metrics.get("Day %", 0) or 0)
+        rvol_self = metrics.get("RVOL", np.nan)
+        if not np.isnan(rvol_self) and rvol_self >= 1.5:
+            points += 1
+        if day <= -4:
+            points -= 1
+
+        points = round(clamp(points, 2, 20), 1)
+        label = "ETF-A" if points >= 16 else "ETF-B" if points >= 12 else "ETF-C" if points >= 8 else "ETF-Weak"
+        reason = "ETF catalyst uses industry/sector leadership, breadth, relative strength and volume rather than company-news headlines."
+        if details:
+            reason += " " + " ".join(details)
+        return {"label": label, "points": points, "reason": reason, "news": [], "kind": "ETF"}
+
+    if t in BROAD_MARKET_ETFS:
+        # Broad ETFs use market regime + own trend instead of company news.
+        regime_name = regime.get("regime", "Neutral / Mixed") if regime else "Neutral / Mixed"
+        regime_points = {
+            "Healthy Risk-On": 15, "Risk-On": 14, "Compression / Watch Breakouts": 12,
+            "Neutral / Mixed": 10, "Conflicted Rally": 9, "Orderly Weakness": 7,
+            "Risk-Off Lean": 5, "Risk-Off": 3,
+        }.get(regime_name, 9)
+        points = float(regime_points)
+        if bool(metrics.get("20D Breakout", False)):
+            points += 2
+        if float(metrics.get("5D %", 0) or 0) > 2:
+            points += 1
+        points = round(clamp(points, 2, 20), 1)
+        label = "ETF-A" if points >= 16 else "ETF-B" if points >= 12 else "ETF-C" if points >= 8 else "ETF-Weak"
+        return {
+            "label": label, "points": points,
+            "reason": f"Broad-market ETF catalyst is based on market regime ({regime_name}) plus ETF trend/breakout confirmation.",
+            "news": [], "kind": "ETF"
+        }
+
+    news = get_news(t)
+    grade, reason = grade_news(news)
+    return {
+        "label": grade,
+        "points": CATALYST_POINTS.get(grade, 4.0),
+        "reason": reason,
+        "news": news,
+        "kind": "Stock"
+    }
+
+
 def buy_score(m, catalyst_grade="?", regime=None, rotation=None, ticker="", direction=1):
     trend = _trend_component(m, direction)
-    catalyst = CATALYST_POINTS.get(catalyst_grade, 4.0)
+    if isinstance(catalyst_grade, dict):
+        catalyst = float(catalyst_grade.get("points", 4.0))
+    else:
+        catalyst = CATALYST_POINTS.get(catalyst_grade, 4.0)
     entry_raw = _entry_component(m, direction)  # max 20
     volume = _volume_component(m)
     market = _market_component(regime, direction)
@@ -486,6 +942,84 @@ def buy_score(m, catalyst_grade="?", regime=None, rotation=None, ticker="", dire
             "Sector Regime": sector,
             "Risk / Reward": rr,
         }
+    }
+
+
+
+def entry_plan(m, score_result=None, direction=1):
+    """
+    Build a volatility-aware reference entry plan from the underlying asset.
+    This is intentionally a zone/trigger framework rather than a single magic price.
+    """
+    try:
+        price = float(m["Price"])
+    except Exception:
+        return None
+
+    atr_pct = float(m.get("ATR %", np.nan))
+    atr = price * atr_pct / 100 if not np.isnan(atr_pct) and atr_pct > 0 else price * 0.035
+
+    day_high = float(m.get("Day High", price))
+    day_low = float(m.get("Day Low", price))
+    high20 = float(m.get("20D High Price", price))
+    low20 = float(m.get("20D Low Price", price))
+    support10 = float(m.get("10D Support Price", low20))
+    entry_q = float(score_result.get("entry_quality", 50)) if score_result else 50
+    day_pct = float(m.get("Day %", 0))
+
+    # Wider-volatility names get a tighter "max chase" allowance in ATR terms.
+    chase_mult = 0.22 if atr_pct >= 10 else 0.30 if atr_pct >= 6 else 0.38
+
+    if direction == 1:
+        # If already breaking out, favor a retest of the old 20D high.
+        if bool(m.get("20D Breakout", False)):
+            anchor = high20
+            zone_low = max(anchor - 0.10 * atr, price - 0.80 * atr)
+            zone_high = min(anchor + 0.30 * atr, price)
+            setup = "Breakout retest"
+        else:
+            # Otherwise use the nearer of short-term support and a volatility pullback.
+            vol_floor = price - 0.60 * atr
+            anchor = max(support10, vol_floor)
+            zone_low = min(anchor, price)
+            # Strong entry quality can include current price; weak/extended setups demand a pullback.
+            zone_high = price if entry_q >= 72 and day_pct < 6 else max(zone_low, price - 0.15 * atr)
+            setup = "Pullback / support"
+
+        trigger = max(day_high, high20) + 0.05 * atr
+        max_chase = trigger + chase_mult * atr
+        stop_ref = max(0.01, zone_low - 0.45 * atr)
+
+        # Avoid inverted/degenerate ranges.
+        zone_low, zone_high = sorted([zone_low, zone_high])
+
+        return {
+            "setup": setup,
+            "zone_low": round(zone_low, 2),
+            "zone_high": round(zone_high, 2),
+            "breakout_trigger": round(trigger, 2),
+            "max_chase": round(max_chase, 2),
+            "stop_ref": round(stop_ref, 2),
+            "basis_price": round(price, 2),
+            "atr_dollars": round(atr, 2),
+        }
+
+    # Bearish / inverse-product logic: mirror around resistance and breakdown.
+    resistance = min(high20, price + 0.60 * atr) if high20 >= price else price + 0.35 * atr
+    zone_low = price if entry_q >= 72 and day_pct > -6 else min(price + 0.15 * atr, resistance)
+    zone_high = max(resistance, zone_low)
+    trigger = min(day_low, low20) - 0.05 * atr
+    max_chase = trigger - chase_mult * atr
+    stop_ref = zone_high + 0.45 * atr
+    return {
+        "setup": "Resistance / breakdown",
+        "zone_low": round(zone_low, 2),
+        "zone_high": round(zone_high, 2),
+        "breakout_trigger": round(trigger, 2),
+        "max_chase": round(max_chase, 2),
+        "stop_ref": round(stop_ref, 2),
+        "basis_price": round(price, 2),
+        "atr_dollars": round(atr, 2),
     }
 
 
@@ -528,9 +1062,12 @@ def enrich_buy_scores(out, regime=None, rotation=None):
     if out.empty:
         return out
     result = out.copy()
-    cols = ["Catalyst Grade", "Buy Score", "Entry Quality", "Setup", "Score Basis", "Leverage Verdict"]
+    cols = [
+        "Catalyst Grade", "Buy Score", "Entry Quality", "Setup", "Score Basis", "Leverage Verdict",
+        "Entry Zone", "Breakout Trigger", "Max Chase", "Stop Ref"
+    ]
     for c in cols:
-        result[c] = "" if c in ["Catalyst Grade","Setup","Score Basis","Leverage Verdict"] else np.nan
+        result[c] = "" if c in ["Catalyst Grade","Setup","Score Basis","Leverage Verdict","Entry Zone"] else np.nan
 
     for idx, row in result.iterrows():
         ticker = row["Ticker"]
@@ -546,14 +1083,34 @@ def enrich_buy_scores(out, regime=None, rotation=None):
                 result.at[idx, "Score Basis"] = basis_ticker
                 result.at[idx, "Setup"] = "No underlying data"
                 continue
-        news = get_news(basis_ticker)
-        grade, _ = grade_news(news)
-        score = buy_score(basis_metrics, grade, regime, rotation, basis_ticker, info["direction"])
-        result.at[idx, "Catalyst Grade"] = grade
+        if LIVE_MODE and len(result) <= 25:
+            try:
+                live_basis, _live_meta = live_overlay_metrics(dict(basis_metrics), basis_ticker)
+                _fresh = freshness_status(_live_meta, MAX_LIVE_AGE)
+                if live_basis is not None and _fresh.get("ok"):
+                    basis_metrics = recompute_momentum_score(live_basis)
+                elif STRICT_FRESHNESS and _fresh.get("market_open"):
+                    result.at[idx, "Setup"] = "STALE DATA"
+                    result.at[idx, "Score Basis"] = basis_ticker
+                    continue
+            except Exception:
+                if STRICT_FRESHNESS:
+                    result.at[idx, "Setup"] = "LIVE DATA ERROR"
+                    result.at[idx, "Score Basis"] = basis_ticker
+                    continue
+        catalyst_signal = resolve_catalyst(basis_ticker, basis_metrics, rotation, regime)
+        score = buy_score(basis_metrics, catalyst_signal, regime, rotation, basis_ticker, info["direction"])
+        result.at[idx, "Catalyst Grade"] = catalyst_signal["label"]
         result.at[idx, "Buy Score"] = score["score"]
         result.at[idx, "Entry Quality"] = score["entry_quality"]
         result.at[idx, "Setup"] = score["label"]
         result.at[idx, "Score Basis"] = basis_ticker if info["is_leveraged"] else ticker
+        plan = entry_plan(basis_metrics, score, info["direction"])
+        if plan:
+            result.at[idx, "Entry Zone"] = f"${plan['zone_low']:.2f}–${plan['zone_high']:.2f}"
+            result.at[idx, "Breakout Trigger"] = plan["breakout_trigger"]
+            result.at[idx, "Max Chase"] = plan["max_chase"]
+            result.at[idx, "Stop Ref"] = plan["stop_ref"]
         if info["is_leveraged"]:
             result.at[idx, "Leverage Verdict"] = leverage_verdict(score, info["leverage"], product_day)
     return result
@@ -635,6 +1192,7 @@ def market_regime():
 # Broad sector + industry + factor leadership universe.
 # Multiple related proxies are intentionally included so a single ETF/index does not dominate the signal.
 ROTATION_GROUPS = {
+    "Technology": ["XLK", "VGT"],
     "Semiconductors": ["SMH", "SOXX", "XSD"],
     "Software / Cloud": ["IGV", "SKYY", "CLOU"],
     "Cybersecurity": ["CIBR", "HACK", "BUG"],
@@ -729,6 +1287,21 @@ LANG = st.sidebar.radio("语言 / Language", ["中文", "English"], horizontal=T
 ZH = LANG == "中文"
 def tr(zh, en):
     return zh if ZH else en
+
+
+with st.sidebar:
+    LIVE_MODE = st.toggle(tr("盘中实时模式", "Intraday Live Mode"), value=True)
+    STRICT_FRESHNESS = st.toggle(tr("严格防旧数据", "Strict stale-data guard"), value=True)
+    MAX_LIVE_AGE = st.select_slider(
+        tr("允许最大延迟", "Maximum allowed delay"),
+        options=[5, 10, 15, 20, 30],
+        value=20,
+        format_func=lambda x: f"{x} min"
+    )
+    st.caption(tr(
+        "盘中如果最新行情超过允许延迟，严格模式会拒绝给 Buy Score，不会偷偷退回昨天数据。",
+        "During the session, if the newest bar exceeds the allowed delay, strict mode refuses to score instead of silently falling back to old daily data."
+    ))
 
 
 GROUP_ZH = {
@@ -935,6 +1508,8 @@ with tab1:
                         score_rotation, _ = rotation_dashboard()
                         out = enrich_buy_scores(out, score_regime, score_rotation)
                 st.subheader(tr("动量候选", "Momentum Candidates"))
+                if LIVE_MODE and len(out) <= 25:
+                    st.caption(tr("候选 Buy Score 会尝试用盘中 1 分钟数据重新覆盖当前价和入场质量。", "Candidate Buy Scores will attempt a 1-minute intraday overlay for current price and entry quality."))
                 st.caption(tr("Momentum Score 看‘有多强’，Buy Score 看‘现在值不值得买’。杠杆 ETF 的 Buy Score 以正股/底层 proxy 为依据。", "Momentum Score measures strength; Buy Score measures setup quality now. Leveraged ETFs are scored from their underlying/proxy."))
                 st.dataframe(localized_momentum(out), use_container_width=True, hide_index=True)
                 st.download_button(tr("下载候选 CSV", "Download Candidates CSV"), out.to_csv(index=False).encode("utf-8"), "momentum_candidates.csv", "text/csv")
@@ -970,6 +1545,10 @@ with tabbuy:
         "Buy Score 是 setup 质量分，不是上涨概率。Momentum 很高但已经过度延伸时，Buy Score 可以明显更低。",
         "Buy Score is a setup-quality score, not a probability of profit. A very strong but overextended move can have a much lower Buy Score."
     ))
+    st.caption(tr(
+        "数据政策：盘中严格模式下，行情超过允许延迟就不评分；休市后只使用最近完成交易日，并明确标注日期。",
+        "Data policy: in strict mode, stale intraday data blocks scoring; after hours, only the latest completed session is used and explicitly dated."
+    ))
 
     b1, b2 = st.columns([1,1])
     with b1:
@@ -977,7 +1556,12 @@ with tabbuy:
     with b2:
         bs_override = st.text_input(tr("底层资产手动覆盖（可选）", "Underlying override (optional)"), value="").upper().strip()
 
-    if st.button(tr("计算 Buy Score", "Calculate Buy Score"), type="primary", use_container_width=True):
+    rcol1, rcol2 = st.columns([3,1])
+    with rcol1:
+        run_buy_score = st.button(tr("计算 / 刷新 Buy Score", "Calculate / Refresh Buy Score"), type="primary", use_container_width=True)
+    with rcol2:
+        st.caption(tr("实时缓存约 45 秒", "Live cache ~45 sec"))
+    if run_buy_score:
         if not bs_ticker:
             st.warning(tr("请输入 ticker。", "Enter a ticker."))
         else:
@@ -1004,18 +1588,63 @@ with tabbuy:
                         f"Partial market data was returned, but {info['underlying']} was missing. Check the ticker or try again shortly."
                     ))
                 else:
-                    basis = basis_rows.iloc[0]
-                    news = get_news(info["underlying"])
-                    grade, reason = grade_news(news)
-                    score = buy_score(basis, grade, regime_bs, rotation_bs, info["underlying"], info["direction"])
+                    basis = basis_rows.iloc[0].to_dict()
+                    live_meta = {"live": False}
+                    freshness = {"ok": True, "market_open": False, "stale": False}
+                    if LIVE_MODE:
+                        basis, live_meta = live_overlay_metrics(basis, info["underlying"])
+                        freshness = freshness_status(live_meta, MAX_LIVE_AGE)
+                        if freshness["ok"]:
+                            basis = recompute_momentum_score(basis)
+
+                    if LIVE_MODE and STRICT_FRESHNESS and not freshness["ok"]:
+                        st.error(tr(
+                            f"拒绝评分：{info['underlying']} 的盘中数据过旧或缺失。{freshness.get('message','')} 请稍后刷新；本次不会使用旧日线数据代替实时行情。",
+                            f"Score blocked: intraday data for {info['underlying']} is stale or missing. {freshness.get('message','')} Refresh later; this run will not substitute old daily data."
+                        ))
+                        st.stop()
+
+                    catalyst_signal = resolve_catalyst(info["underlying"], basis, rotation_bs, regime_bs)
+                    grade = catalyst_signal["label"]
+                    reason = catalyst_signal["reason"]
+                    news = catalyst_signal["news"]
+                    score = buy_score(basis, catalyst_signal, regime_bs, rotation_bs, info["underlying"], info["direction"])
                     product_day = float(product_rows.iloc[0]["Day %"]) if not product_rows.empty else np.nan
                     verdict = leverage_verdict(score, info["leverage"], product_day) if info["is_leveraged"] else "—"
 
                     a,b,c,d = st.columns(4)
                     a.metric(tr("Buy Score" if info["direction"] == 1 else "Directional Score", "Buy Score" if info["direction"] == 1 else "Directional Score"), f"{score['score']:.0f}/100", delta=score["label"])
                     b.metric(tr("Entry Quality", "Entry Quality"), f"{score['entry_quality']:.0f}/100")
-                    c.metric(tr("Catalyst", "Catalyst"), grade)
+                    c.metric(
+                        tr("Catalyst", "Catalyst"),
+                        grade,
+                        delta=f"{score['components']['Catalyst']:.1f}/20"
+                    )
                     d.metric(tr("Momentum", "Momentum"), f"{float(basis['Momentum Score']):.0f}/100")
+
+                    if LIVE_MODE:
+                        if freshness.get("market_open") and freshness.get("ok"):
+                            age = freshness.get("age_minutes")
+                            st.success(tr(
+                                f"盘中数据已验证 · {live_meta.get('timestamp','')} · 延迟约 {age:.1f} 分钟",
+                                f"Intraday data verified · {live_meta.get('timestamp','')} · about {age:.1f} min old"
+                            ))
+                        elif not freshness.get("market_open"):
+                            if live_meta.get("live"):
+                                st.info(tr(
+                                    f"当前为休市时段；显示最近交易数据 · {live_meta.get('timestamp','')}",
+                                    f"Market is closed; showing latest traded data · {live_meta.get('timestamp','')}"
+                                ))
+                            else:
+                                st.info(tr(
+                                    "当前为休市时段；本次使用最近一个已完成交易日的日线数据，并不会标记为实时。",
+                                    "Market is closed; using the latest completed daily session, explicitly not marked as live."
+                                ))
+                        else:
+                            st.error(tr(
+                                "盘中数据未通过新鲜度检查。",
+                                "Intraday data failed the freshness check."
+                            ))
 
                     if info["is_leveraged"]:
                         proxy_word = tr("底层 proxy", "underlying proxy") if info["proxy"] else tr("正股", "underlying stock")
@@ -1040,15 +1669,62 @@ with tabbuy:
                     st.markdown(tr("#### 分数组成", "#### Score Breakdown"))
                     st.dataframe(comp, use_container_width=True, hide_index=True)
 
-                    q1,q2,q3,q4 = st.columns(4)
-                    q1.metric(tr("底层 1D", "Underlying 1D"), f"{float(basis['Day %']):+.2f}%")
-                    q2.metric(tr("底层 5D", "Underlying 5D"), f"{float(basis['5D %']):+.2f}%")
-                    q3.metric("RVOL", f"{float(basis['RVOL']):.2f}x" if not np.isnan(basis['RVOL']) else "N/A")
-                    q4.metric("ATR %", f"{float(basis['ATR %']):.2f}%" if not np.isnan(basis['ATR %']) else "N/A")
+                    q1,q2,q3,q4,q5 = st.columns(5)
+                    q1.metric(tr("当前价", "Current Price"), f"${float(basis['Price']):.2f}")
+                    q2.metric(tr("底层 1D", "Underlying 1D"), f"{float(basis['Day %']):+.2f}%")
+                    q3.metric(tr("底层 5D", "Underlying 5D"), f"{float(basis['5D %']):+.2f}%")
+                    q4.metric("RVOL", f"{float(basis['RVOL']):.2f}x" if not np.isnan(basis['RVOL']) else "N/A")
+                    q5.metric("ATR %", f"{float(basis['ATR %']):.2f}%" if not np.isnan(basis['ATR %']) else "N/A")
 
-                    st.markdown(tr("#### 催化剂新闻", "#### Catalyst News"))
+                    plan = entry_plan(basis, score, info["direction"])
+                    if plan:
+                        st.markdown(tr("#### 参考入场计划", "#### Reference Entry Plan"))
+                        st.caption(tr(
+                            f"以下价格全部以评分底层 {info['underlying']} 为依据，不是保证成交或盈利的价格预测。",
+                            f"All levels below are based on the scoring underlying {info['underlying']}; they are reference levels, not guaranteed fills or profit forecasts."
+                        ))
+
+                        e1,e2,e3,e4 = st.columns(4)
+                        e1.metric(
+                            tr("推荐回踩区间", "Preferred Pullback Zone"),
+                            f"${plan['zone_low']:.2f} – ${plan['zone_high']:.2f}"
+                        )
+                        e2.metric(
+                            tr("突破确认价", "Breakout Trigger"),
+                            f"${plan['breakout_trigger']:.2f}"
+                        )
+                        e3.metric(
+                            tr("最高可追参考", "Max Chase Reference"),
+                            f"${plan['max_chase']:.2f}"
+                        )
+                        e4.metric(
+                            tr("参考止损位", "Reference Stop"),
+                            f"${plan['stop_ref']:.2f}"
+                        )
+
+                        if info["direction"] == 1:
+                            st.write(tr(
+                                f"计划类型：{plan['setup']}。优先等价格进入回踩区间；如果不给回踩，则至少等 {info['underlying']} 有效突破 ${plan['breakout_trigger']:.2f}。高于约 ${plan['max_chase']:.2f} 后，V6.7 会把它视为追价区，不因为 Momentum 高就自动追。",
+                                f"Plan type: {plan['setup']}. Prefer a pullback into the zone; if no pullback occurs, wait for {info['underlying']} to clear about ${plan['breakout_trigger']:.2f}. Above roughly ${plan['max_chase']:.2f}, V6.7 treats the move as chase territory rather than buying solely because momentum is high."
+                            ))
+                        else:
+                            st.write(tr(
+                                f"这是反向/看空产品的底层触发逻辑。优先看 {info['underlying']} 的阻力区和向下突破 ${plan['breakout_trigger']:.2f}。",
+                                f"This is the underlying trigger logic for an inverse/bearish product. Focus on resistance and a downside break below about ${plan['breakout_trigger']:.2f} in {info['underlying']}."
+                            ))
+
+                        if info["is_leveraged"]:
+                            st.warning(tr(
+                                f"{bs_ticker} 是杠杆产品：这些入场价是 {info['underlying']} 的触发条件，不建议把底层的价格区间机械换算成 {bs_ticker} 的价格。底层先触发，再看杠杆 ETF 当时的盘口。",
+                                f"{bs_ticker} is leveraged: these levels are triggers on {info['underlying']}. Do not mechanically convert them into a fixed {bs_ticker} price; wait for the underlying trigger, then evaluate the leveraged ETF at that moment."
+                            ))
+
+                    st.markdown(tr(
+                        "#### 催化剂 / 行业信号" if catalyst_signal.get("kind") == "ETF" else "#### 催化剂新闻",
+                        "#### Catalyst / Industry Signal" if catalyst_signal.get("kind") == "ETF" else "#### Catalyst News"
+                    ))
                     st.write(reason)
-                    if not news:
+                    if not news and catalyst_signal.get("kind") != "ETF":
                         st.write(tr("没有返回可用新闻。", "No usable headline returned."))
                     for item in news[:5]:
                         title = item["title"] or "(untitled)"
